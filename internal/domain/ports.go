@@ -7,10 +7,14 @@ type UsuarioRepository interface {
 	ObtenerPorEmail(ctx context.Context, email string) (*Usuario, error)
 	ObtenerPorID(ctx context.Context, id string) (*Usuario, error)
 	ObtenerPorIDs(ctx context.Context, ids []string) ([]*Usuario, error)
-	ActualizarRamos(ctx context.Context, usuarioID string, ramoCodigos []string) (*Usuario, error)
-	BuscarTutoresPorRamo(ctx context.Context, ramoCodigo string) ([]*Usuario, error)
+
+	// Reemplazan a ActualizarRamos:
+	AgregarRamosTutorTx(ctx context.Context, usuarioID string, ramos []InscripcionRamoInput) error
+	CambiarEstadoRamoTx(ctx context.Context, usuarioID, ramoCodigo string, activo bool) error
+
 	ListarRamos(ctx context.Context) ([]Ramo, error)
-	VerificarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, bool, error)
+	ListarTutoresPorRamo(ctx context.Context, ramoCodigo string) ([]*Usuario, error)
+	ValidarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, bool, error)
 }
 
 type PasswordHasher interface {

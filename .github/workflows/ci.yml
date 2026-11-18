@@ -1,0 +1,33 @@
+name: CI Usuarios
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositorio y submódulo de contratos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Descargar dependencias
+        run: go mod download
+
+      - name: Verificar análisis estático (go vet)
+        run: go vet ./cmd/... ./internal/...
+
+      - name: Ejecutar tests unitarios y medir cobertura
+        run: go test -v -cover ./internal/...
+
+      - name: Compilar binario del servidor
+        run: go build -v -o usuarios-server ./cmd/server/main.go

@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usuarios-grpc
+  labels:
+    app: usuarios-grpc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: usuarios-grpc
+  template:
+    metadata:
+      labels:
+        app: usuarios-grpc
+    spec:
+      containers:
+        - name: usuarios-grpc
+          image: tutormatch-usuarios-grpc:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+          env:
+            - name: PORT
+              value: "50051"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: usuarios-secrets
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usuarios-service
+spec:
+  type: ClusterIP
+  selector:
+    app: usuarios-grpc
+  ports:
+    - protocol: TCP
+      port: 50051
+      targetPort: 50051

@@ -17,5 +17,18 @@ services:
       timeout: 5s
       retries: 5
 
+  usuarios-grpc:
+    build: .
+    container_name: tutormatch-usuarios-grpc
+    ports:
+      - "50051:50051"
+    environment:
+      DATABASE_URL: "postgres://tutormatch:secretpassword@postgres:5432/usuarios_db?sslmode=disable"
+      JWT_SECRET: "dev-secret-cambiar-en-produccion"
+      PORT: "50051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:

@@ -20,16 +20,26 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
+const defaultDevJWTSecret = "dev-secret-cambiar-en-produccion"
+
 func main() {
 	dbURL := getEnv("DATABASE_URL", "postgres://tutormatch:secretpassword@localhost:5432/usuarios_db?sslmode=disable")
-	jwtSecret := getEnv("JWT_SECRET", "dev-secret-cambiar-en-produccion")
+	jwtSecret := getEnv("JWT_SECRET", defaultDevJWTSecret)
 	port := getEnv("PORT", "50051")
+
+	if jwtSecret == defaultDevJWTSecret {
+		log.Println("ADVERTENCIA: usando JWT_SECRET de desarrollo; configurar Secret en producción")
+	}
 
 	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		log.Fatalf("error abriendo conexión a postgres: %v", err)
 	}
 	defer db.Close()
+
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

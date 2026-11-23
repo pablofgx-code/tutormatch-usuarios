@@ -1,0 +1,7 @@
+.git
+contracts/.git
+bin/
+coverage.out
+usuarios-server
+*.exe
+.env

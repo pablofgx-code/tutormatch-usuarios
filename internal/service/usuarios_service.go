@@ -28,7 +28,7 @@ func (s *UsuarioService) RegistroUsuario(ctx context.Context, nombre, email, pas
 	nombre = strings.TrimSpace(nombre)
 	email = domain.NormalizarEmail(email)
 
-	if nombre == "" || !domain.EsEmailValido(email) || password == "" {
+	if !domain.EsNombreValido(nombre) || !domain.EsEmailValido(email) || !domain.EsPasswordValida(password) {
 		return "", nil, domain.ErrArgumentoInvalido
 	}
 
@@ -56,16 +56,18 @@ func (s *UsuarioService) RegistroUsuario(ctx context.Context, nombre, email, pas
 	return token, usuario, nil
 }
 
-// Login verifica credenciales y devuelve el token JWT (HS256, 24h) más el usuario.
+// Login verifica credenciales con mitigación de timing attack y devuelve el JWT (HS256, 24h).
 func (s *UsuarioService) Login(ctx context.Context, email, password string) (string, *domain.Usuario, error) {
 	email = domain.NormalizarEmail(email)
-	if email == "" || password == "" {
+	if !domain.EsEmailValido(email) || !domain.EsPasswordValida(password) {
 		return "", nil, domain.ErrArgumentoInvalido
 	}
 
 	usuario, err := s.repo.ObtenerPorEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, domain.ErrNoEncontrado) {
+			// Ejecuta trabajo equivalente a bcrypt para evitar enumeración de correos por tiempo.
+			s.hasher.Compare("", password)
 			return "", nil, domain.ErrCredenciales
 		}
 		return "", nil, err
@@ -94,13 +96,24 @@ func (s *UsuarioService) ObtenerUsuario(ctx context.Context, id string) (*domain
 	return s.repo.ObtenerPorID(ctx, id)
 }
 
+// ObtenerUsuarios filtra UUIDs válidos, deduplica en O(N) y acota el tamaño máximo del lote.
 func (s *UsuarioService) ObtenerUsuarios(ctx context.Context, ids []string) ([]*domain.Usuario, error) {
+	if len(ids) > domain.MaxBatchIDs {
+		return nil, domain.ErrArgumentoInvalido
+	}
+
+	vistos := make(map[string]struct{}, len(ids))
 	validos := make([]string, 0, len(ids))
 	for _, raw := range ids {
 		id := strings.TrimSpace(raw)
-		if domain.EsUUIDValido(id) {
-			validos = append(validos, id)
+		if !domain.EsUUIDValido(id) {
+			continue
 		}
+		if _, dup := vistos[id]; dup {
+			continue
+		}
+		vistos[id] = struct{}{}
+		validos = append(validos, id)
 	}
 	if len(validos) == 0 {
 		return []*domain.Usuario{}, nil
@@ -111,21 +124,20 @@ func (s *UsuarioService) ObtenerUsuarios(ctx context.Context, ids []string) ([]*
 // AgregarRamosTutor valida el formulario (nota 4.0..7.0 y periodo YYYY-1/2) e inscribe en transacción.
 func (s *UsuarioService) AgregarRamosTutor(ctx context.Context, usuarioID string, ramos []domain.InscripcionRamoInput) (*domain.Usuario, error) {
 	usuarioID = strings.TrimSpace(usuarioID)
-	if usuarioID == "" || len(ramos) == 0 {
+	if usuarioID == "" || len(ramos) == 0 || len(ramos) > domain.MaxRamosPorSolicitud {
 		return nil, domain.ErrArgumentoInvalido
 	}
 
-	// Validamos formato y que no vengan códigos duplicados en la misma petición.
-	vistos := make(map[string]bool, len(ramos))
+	vistos := make(map[string]struct{}, len(ramos))
 	for i := range ramos {
 		ramos[i].RamoCodigo = strings.TrimSpace(ramos[i].RamoCodigo)
 		if err := ramos[i].Validar(); err != nil {
 			return nil, err
 		}
-		if vistos[ramos[i].RamoCodigo] {
+		if _, dup := vistos[ramos[i].RamoCodigo]; dup {
 			return nil, domain.ErrArgumentoInvalido
 		}
-		vistos[ramos[i].RamoCodigo] = true
+		vistos[ramos[i].RamoCodigo] = struct{}{}
 	}
 
 	if !domain.EsUUIDValido(usuarioID) {
@@ -141,24 +153,15 @@ func (s *UsuarioService) AgregarRamosTutor(ctx context.Context, usuarioID string
 
 // QuitarRamoTutor desactiva un ramo conservando los datos de verificación y recalcula es_tutor.
 func (s *UsuarioService) QuitarRamoTutor(ctx context.Context, usuarioID, ramoCodigo string) (*domain.Usuario, error) {
-	usuarioID = strings.TrimSpace(usuarioID)
-	ramoCodigo = strings.TrimSpace(ramoCodigo)
-	if usuarioID == "" || ramoCodigo == "" {
-		return nil, domain.ErrArgumentoInvalido
-	}
-	if !domain.EsUUIDValido(usuarioID) {
-		return nil, domain.ErrNoEncontrado
-	}
-
-	if err := s.repo.CambiarEstadoRamoTx(ctx, usuarioID, ramoCodigo, false); err != nil {
-		return nil, err
-	}
-
-	return s.repo.ObtenerPorID(ctx, usuarioID)
+	return s.cambiarEstadoRamo(ctx, usuarioID, ramoCodigo, false)
 }
 
 // ReactivarRamoTutor vuelve a activar un ramo previamente inscrito y recalcula es_tutor.
 func (s *UsuarioService) ReactivarRamoTutor(ctx context.Context, usuarioID, ramoCodigo string) (*domain.Usuario, error) {
+	return s.cambiarEstadoRamo(ctx, usuarioID, ramoCodigo, true)
+}
+
+func (s *UsuarioService) cambiarEstadoRamo(ctx context.Context, usuarioID, ramoCodigo string, activo bool) (*domain.Usuario, error) {
 	usuarioID = strings.TrimSpace(usuarioID)
 	ramoCodigo = strings.TrimSpace(ramoCodigo)
 	if usuarioID == "" || ramoCodigo == "" {
@@ -168,7 +171,7 @@ func (s *UsuarioService) ReactivarRamoTutor(ctx context.Context, usuarioID, ramo
 		return nil, domain.ErrNoEncontrado
 	}
 
-	if err := s.repo.CambiarEstadoRamoTx(ctx, usuarioID, ramoCodigo, true); err != nil {
+	if err := s.repo.CambiarEstadoRamoTx(ctx, usuarioID, ramoCodigo, activo); err != nil {
 		return nil, err
 	}
 
@@ -198,10 +201,5 @@ func (s *UsuarioService) ValidarTutorRamo(ctx context.Context, tutorID, ramoCodi
 		return false, nil
 	}
 
-	existe, activo, err := s.repo.ValidarTutorRamo(ctx, tutorID, ramoCodigo)
-	if err != nil {
-		return false, err
-	}
-
-	return existe && activo, nil
+	return s.repo.ValidarTutorRamo(ctx, tutorID, ramoCodigo)
 }

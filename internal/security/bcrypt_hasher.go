@@ -1,22 +1,37 @@
 package security
 
-import "golang.org/x/crypto/bcrypt"
+import (
+	"github.com/tutormatch/usuarios/internal/domain"
+	"golang.org/x/crypto/bcrypt"
+)
 
-// BcryptHasher implementa la interfaz domain.PasswordHasher
-type BcryptHasher struct{}
-
-func NewBcryptHasher() *BcryptHasher {
-	return &BcryptHasher{}
+// BcryptHasher implementa domain.PasswordHasher con protección contra timing attacks.
+type BcryptHasher struct {
+	dummyHash []byte
 }
 
-// Hash encripta la contraseña usando el algoritmo bcrypt con el costo por defecto
+func NewBcryptHasher() *BcryptHasher {
+	dummy, _ := bcrypt.GenerateFromPassword([]byte("tutormatch-timing-guard"), bcrypt.DefaultCost)
+	return &BcryptHasher{dummyHash: dummy}
+}
+
+// Hash encripta la contraseña con bcrypt validando el límite nativo de 72 bytes.
 func (h *BcryptHasher) Hash(password string) (string, error) {
+	if !domain.EsPasswordValida(password) {
+		return "", domain.ErrArgumentoInvalido
+	}
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(bytes), err
 }
 
-// Compare verifica si la contraseña en texto plano coincide con el hash de la base de datos
+// Compare verifica la contraseña; si hash está vacío compara contra dummyHash para igualar tiempos.
 func (h *BcryptHasher) Compare(hash, password string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	return err == nil
+	if !domain.EsPasswordValida(password) {
+		return false
+	}
+	if hash == "" {
+		_ = bcrypt.CompareHashAndPassword(h.dummyHash, []byte(password))
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }

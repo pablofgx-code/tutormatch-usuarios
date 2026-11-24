@@ -18,6 +18,19 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 	return &PostgresRepository{db: db}
 }
 
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// escanearUsuario centraliza (DRY) la lectura de columnas de la tabla usuarios.
+func escanearUsuario(s rowScanner) (*domain.Usuario, error) {
+	u := &domain.Usuario{}
+	if err := s.Scan(&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
 func (r *PostgresRepository) CrearUsuario(ctx context.Context, u *domain.Usuario) error {
 	query := `
 		INSERT INTO usuarios (id, nombre, email, password_hash, es_tutor, creado_en)
@@ -42,12 +55,7 @@ func (r *PostgresRepository) ObtenerPorEmail(ctx context.Context, email string) 
 		FROM usuarios
 		WHERE lower(email) = lower($1)
 	`
-	u := &domain.Usuario{}
-	emailNormalizado := domain.NormalizarEmail(email)
-
-	err := r.db.QueryRowContext(ctx, query, emailNormalizado).Scan(
-		&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn,
-	)
+	u, err := escanearUsuario(r.db.QueryRowContext(ctx, query, domain.NormalizarEmail(email)))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrNoEncontrado
@@ -70,10 +78,7 @@ func (r *PostgresRepository) ObtenerPorID(ctx context.Context, id string) (*doma
 		FROM usuarios
 		WHERE id = $1
 	`
-	u := &domain.Usuario{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn,
-	)
+	u, err := escanearUsuario(r.db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || esErrorUUIDInvalido(err) {
 			return nil, domain.ErrNoEncontrado
@@ -90,6 +95,7 @@ func (r *PostgresRepository) ObtenerPorID(ctx context.Context, id string) (*doma
 	return u, nil
 }
 
+// ObtenerPorIDs evita el problema N+1: 1 consulta de usuarios + 1 consulta en lote de ramos (O(N+M)).
 func (r *PostgresRepository) ObtenerPorIDs(ctx context.Context, ids []string) ([]*domain.Usuario, error) {
 	if len(ids) == 0 {
 		return []*domain.Usuario{}, nil
@@ -106,21 +112,22 @@ func (r *PostgresRepository) ObtenerPorIDs(ctx context.Context, ids []string) ([
 	}
 	defer rows.Close()
 
-	var usuarios []*domain.Usuario
+	usuarios := make([]*domain.Usuario, 0, len(ids))
 	for rows.Next() {
-		u := &domain.Usuario{}
-		if err := rows.Scan(&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn); err != nil {
-			return nil, err
-		}
-		ramos, err := r.obtenerRamosDeUsuario(ctx, u.ID)
+		u, err := escanearUsuario(rows)
 		if err != nil {
 			return nil, err
 		}
-		u.Ramos = ramos
 		usuarios = append(usuarios, u)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterando usuarios en lote: %w", err)
+	}
+	// Cerramos rows antes de la segunda consulta para devolver la conexión al pool de inmediato.
+	rows.Close()
+
+	if err := r.cargarRamosEnLote(ctx, usuarios); err != nil {
+		return nil, err
 	}
 
 	return usuarios, nil
@@ -213,6 +220,7 @@ func (r *PostgresRepository) ListarRamos(ctx context.Context) ([]domain.Ramo, er
 	return ramos, nil
 }
 
+// ListarTutoresPorRamo resuelve todos los tutores y sus ramos en 2 consultas fijas (sin N+1).
 func (r *PostgresRepository) ListarTutoresPorRamo(ctx context.Context, ramoCodigo string) ([]*domain.Usuario, error) {
 	query := `
 		SELECT u.id, u.nombre, u.email, u.password_hash, u.es_tutor, u.creado_en
@@ -228,47 +236,39 @@ func (r *PostgresRepository) ListarTutoresPorRamo(ctx context.Context, ramoCodig
 
 	var tutores []*domain.Usuario
 	for rows.Next() {
-		u := &domain.Usuario{}
-		if err := rows.Scan(&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn); err != nil {
-			return nil, err
-		}
-		ramos, err := r.obtenerRamosDeUsuario(ctx, u.ID)
+		u, err := escanearUsuario(rows)
 		if err != nil {
 			return nil, err
 		}
-		u.Ramos = ramos
 		tutores = append(tutores, u)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterando tutores por ramo: %w", err)
 	}
+	rows.Close()
+
+	if err := r.cargarRamosEnLote(ctx, tutores); err != nil {
+		return nil, err
+	}
 
 	return tutores, nil
 }
 
-func (r *PostgresRepository) ValidarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, bool, error) {
-	var existe bool
-	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM usuarios WHERE id = $1)`, tutorID).Scan(&existe)
-	if err != nil {
-		if esErrorUUIDInvalido(err) {
-			return false, false, nil
-		}
-		return false, false, err
-	}
-	if !existe {
-		return false, false, nil
-	}
-
+// ValidarTutorRamo verifica en una sola consulta SQL gracias a la FK tutor_ramos.usuario_id -> usuarios.id.
+func (r *PostgresRepository) ValidarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, error) {
 	var activo bool
-	err = r.db.QueryRowContext(ctx,
+	err := r.db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM tutor_ramos WHERE usuario_id = $1 AND ramo_codigo = $2 AND activo = true)`,
 		tutorID, ramoCodigo,
 	).Scan(&activo)
 	if err != nil {
-		return true, false, err
+		if esErrorUUIDInvalido(err) {
+			return false, nil
+		}
+		return false, err
 	}
 
-	return true, activo, nil
+	return activo, nil
 }
 
 // recalcularEsTutor aplica las reglas 2 y 3 dentro de la misma transacción.
@@ -318,6 +318,57 @@ func (r *PostgresRepository) obtenerRamosDeUsuario(ctx context.Context, usuarioI
 	}
 
 	return ramos, nil
+}
+
+// cargarRamosEnLote trae los ramos de un conjunto de usuarios en una única query y los cruza en O(1) por fila.
+func (r *PostgresRepository) cargarRamosEnLote(ctx context.Context, usuarios []*domain.Usuario) error {
+	if len(usuarios) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(usuarios))
+	porID := make(map[string]*domain.Usuario, len(usuarios))
+	for _, u := range usuarios {
+		ids = append(ids, u.ID)
+		porID[u.ID] = u
+	}
+
+	query := `
+		SELECT tr.usuario_id, r.codigo, r.nombre, tr.nota_aprobacion, tr.periodo_aprobacion, tr.activo, tr.verificado_en
+		FROM tutor_ramos tr
+		JOIN ramos r ON r.codigo = tr.ramo_codigo
+		WHERE tr.usuario_id = ANY($1)
+		ORDER BY tr.usuario_id ASC, r.codigo ASC
+	`
+	rows, err := r.db.QueryContext(ctx, query, ids)
+	if err != nil {
+		return fmt.Errorf("error cargando ramos en lote: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var usuarioID string
+		var rt domain.RamoTutor
+		if err := rows.Scan(
+			&usuarioID,
+			&rt.Ramo.Codigo,
+			&rt.Ramo.Nombre,
+			&rt.NotaAprobacion,
+			&rt.PeriodoAprobacion,
+			&rt.Activo,
+			&rt.VerificadoEn,
+		); err != nil {
+			return err
+		}
+		if u, ok := porID[usuarioID]; ok {
+			u.Ramos = append(u.Ramos, rt)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterando ramos en lote: %w", err)
+	}
+
+	return nil
 }
 
 func esErrorDuplicado(err error) bool {

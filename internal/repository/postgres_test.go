@@ -14,7 +14,7 @@ import (
 	"github.com/tutormatch/usuarios/internal/domain"
 )
 
-// Driver SQL liviano en memoria para probar PostgresRepository sin requerir contenedor Docker.
+// Driver SQL liviano en memoria para probar PostgresRepository sin requerir Docker.
 type fakeHandlers struct {
 	onQuery func(query string, args []driver.NamedValue) (driver.Rows, error)
 	onExec  func(query string, args []driver.NamedValue) (driver.Result, error)
@@ -99,9 +99,11 @@ func abrirRepoFake(t *testing.T, h *fakeHandlers) *PostgresRepository {
 	return NewPostgresRepository(db)
 }
 
-func TestPostgresRepository_CrearYObtener(t *testing.T) {
+func TestPostgresRepository_CrearYObtenerSinNMasUno(t *testing.T) {
 	ahora := time.Now().UTC()
-	const uid = "11111111-1111-4111-8111-111111111111"
+	const uid1 = "11111111-1111-4111-8111-111111111111"
+	const uid2 = "22222222-2222-4222-8222-222222222222"
+	consultasLoteRamos := 0
 
 	repo := abrirRepoFake(t, &fakeHandlers{
 		onQuery: func(query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -112,9 +114,18 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 				}
 				return &fakeRows{
 					cols: []string{"id", "es_tutor"},
-					data: [][]driver.Value{{uid, false}},
+					data: [][]driver.Value{{uid1, false}},
 				}, nil
-			case strings.Contains(query, "FROM tutor_ramos tr"):
+			case strings.Contains(query, "WHERE tr.usuario_id = ANY($1)"):
+				consultasLoteRamos++
+				return &fakeRows{
+					cols: []string{"usuario_id", "codigo", "nombre", "nota", "periodo", "activo", "verificado_en"},
+					data: [][]driver.Value{
+						{uid1, "MAT1610", "Cálculo I", 6.5, "2025-2", true, ahora},
+						{uid2, "FIS1514", "Dinámica", 5.8, "2025-1", true, ahora},
+					},
+				}, nil
+			case strings.Contains(query, "WHERE tr.usuario_id = $1"):
 				return &fakeRows{
 					cols: []string{"codigo", "nombre", "nota", "periodo", "activo", "verificado_en"},
 					data: [][]driver.Value{{"MAT1610", "Cálculo I", 6.5, "2025-2", true, ahora}},
@@ -125,7 +136,7 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 				}
 				return &fakeRows{
 					cols: []string{"id", "nombre", "email", "password_hash", "es_tutor", "creado_en"},
-					data: [][]driver.Value{{uid, "Ana", "ana@ucn.cl", "hash", true, ahora}},
+					data: [][]driver.Value{{uid1, "Ana", "ana@ucn.cl", "hash", true, ahora}},
 				}, nil
 			case strings.Contains(query, "WHERE id = $1"):
 				if args[0].Value == "mal-uuid" {
@@ -133,12 +144,15 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 				}
 				return &fakeRows{
 					cols: []string{"id", "nombre", "email", "password_hash", "es_tutor", "creado_en"},
-					data: [][]driver.Value{{uid, "Ana", "ana@ucn.cl", "hash", true, ahora}},
+					data: [][]driver.Value{{uid1, "Ana", "ana@ucn.cl", "hash", true, ahora}},
 				}, nil
 			case strings.Contains(query, "WHERE id = ANY($1)"):
 				return &fakeRows{
 					cols: []string{"id", "nombre", "email", "password_hash", "es_tutor", "creado_en"},
-					data: [][]driver.Value{{uid, "Ana", "ana@ucn.cl", "hash", true, ahora}},
+					data: [][]driver.Value{
+						{uid1, "Ana", "ana@ucn.cl", "hash", true, ahora},
+						{uid2, "Beto", "beto@ucn.cl", "hash", true, ahora},
+					},
 				}, nil
 			}
 			return &fakeRows{}, nil
@@ -147,7 +161,7 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 
 	ctx := context.Background()
 	u := &domain.Usuario{Nombre: "Ana", Email: "ana@ucn.cl", PasswordHash: "hash", CreadoEn: ahora}
-	if err := repo.CrearUsuario(ctx, u); err != nil || u.ID != uid {
+	if err := repo.CrearUsuario(ctx, u); err != nil || u.ID != uid1 {
 		t.Fatalf("CrearUsuario falló: id=%q err=%v", u.ID, err)
 	}
 	if err := repo.CrearUsuario(ctx, &domain.Usuario{Email: "duplicado@ucn.cl"}); !errors.Is(err, domain.ErrYaExiste) {
@@ -162,7 +176,7 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
 	}
 
-	if _, err := repo.ObtenerPorID(ctx, uid); err != nil {
+	if _, err := repo.ObtenerPorID(ctx, uid1); err != nil {
 		t.Fatalf("ObtenerPorID falló: %v", err)
 	}
 	if _, err := repo.ObtenerPorID(ctx, "mal-uuid"); !errors.Is(err, domain.ErrNoEncontrado) {
@@ -172,12 +186,15 @@ func TestPostgresRepository_CrearYObtener(t *testing.T) {
 	if vacio, err := repo.ObtenerPorIDs(ctx, nil); err != nil || len(vacio) != 0 {
 		t.Fatalf("ObtenerPorIDs vacío falló: %v", err)
 	}
-	if lote, err := repo.ObtenerPorIDs(ctx, []string{uid}); err != nil || len(lote) != 1 {
-		t.Fatalf("ObtenerPorIDs falló: len=%d err=%v", len(lote), err)
+
+	// Verifica que 2 usuarios cargan sus ramos con UNA sola consulta en lote (sin N+1)
+	lote, err := repo.ObtenerPorIDs(ctx, []string{uid1, uid2})
+	if err != nil || len(lote) != 2 || len(lote[0].Ramos) != 1 || len(lote[1].Ramos) != 1 || consultasLoteRamos != 1 {
+		t.Fatalf("ObtenerPorIDs lote inesperado: len=%d consultasRamos=%d err=%v", len(lote), consultasLoteRamos, err)
 	}
 }
 
-func TestPostgresRepository_RamosYValidacion(t *testing.T) {
+func TestPostgresRepository_RamosYValidacionUnicaQuery(t *testing.T) {
 	ahora := time.Now().UTC()
 	const uid = "11111111-1111-4111-8111-111111111111"
 
@@ -213,20 +230,18 @@ func TestPostgresRepository_RamosYValidacion(t *testing.T) {
 					cols: []string{"id", "nombre", "email", "password_hash", "es_tutor", "creado_en"},
 					data: [][]driver.Value{{uid, "Ana", "ana@ucn.cl", "hash", true, ahora}},
 				}, nil
-			case strings.Contains(query, "FROM tutor_ramos tr"):
+			case strings.Contains(query, "WHERE tr.usuario_id = ANY($1)"):
 				return &fakeRows{
-					cols: []string{"codigo", "nombre", "nota", "periodo", "activo", "verificado_en"},
-					data: [][]driver.Value{{"MAT1610", "Cálculo I", 6.5, "2025-2", true, ahora}},
+					cols: []string{"usuario_id", "codigo", "nombre", "nota", "periodo", "activo", "verificado_en"},
+					data: [][]driver.Value{{uid, "MAT1610", "Cálculo I", 6.5, "2025-2", true, ahora}},
 				}, nil
-			case strings.Contains(query, "FROM usuarios WHERE id = $1"):
+			case strings.Contains(query, "FROM tutor_ramos WHERE usuario_id = $1"):
 				if args[0].Value == "no-existe" {
 					return &fakeRows{cols: []string{"exists"}, data: [][]driver.Value{{false}}}, nil
 				}
 				if args[0].Value == "mal-uuid" {
 					return nil, errors.New("22P02")
 				}
-				return &fakeRows{cols: []string{"exists"}, data: [][]driver.Value{{true}}}, nil
-			case strings.Contains(query, "FROM tutor_ramos WHERE usuario_id = $1"):
 				return &fakeRows{cols: []string{"exists"}, data: [][]driver.Value{{true}}}, nil
 			}
 			return &fakeRows{}, nil
@@ -235,11 +250,9 @@ func TestPostgresRepository_RamosYValidacion(t *testing.T) {
 
 	ctx := context.Background()
 
-	// AgregarRamosTutorTx: ok, duplicado y FK inexistente
-	err := repo.AgregarRamosTutorTx(ctx, uid, []domain.InscripcionRamoInput{
+	if err := repo.AgregarRamosTutorTx(ctx, uid, []domain.InscripcionRamoInput{
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.5, PeriodoAprobacion: "2025-2"},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("AgregarRamosTutorTx falló: %v", err)
 	}
 	if err := repo.AgregarRamosTutorTx(ctx, uid, []domain.InscripcionRamoInput{{RamoCodigo: "DUP"}}); !errors.Is(err, domain.ErrYaExiste) {
@@ -249,7 +262,6 @@ func TestPostgresRepository_RamosYValidacion(t *testing.T) {
 		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
 	}
 
-	// CambiarEstadoRamoTx: ok y 0 filas afectadas
 	if err := repo.CambiarEstadoRamoTx(ctx, uid, "MAT1610", false); err != nil {
 		t.Fatalf("CambiarEstadoRamoTx falló: %v", err)
 	}
@@ -257,22 +269,66 @@ func TestPostgresRepository_RamosYValidacion(t *testing.T) {
 		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
 	}
 
-	// ListarRamos y ListarTutoresPorRamo
 	if ramos, err := repo.ListarRamos(ctx); err != nil || len(ramos) != 1 {
 		t.Fatalf("ListarRamos falló: %v", err)
 	}
-	if tutores, err := repo.ListarTutoresPorRamo(ctx, "MAT1610"); err != nil || len(tutores) != 1 {
-		t.Fatalf("ListarTutoresPorRamo falló: %v", err)
+	if tutores, err := repo.ListarTutoresPorRamo(ctx, "MAT1610"); err != nil || len(tutores) != 1 || len(tutores[0].Ramos) != 1 {
+		t.Fatalf("ListarTutoresPorRamo falló: %+v err=%v", tutores, err)
 	}
 
-	// ValidarTutorRamo: activo, no existe y UUID inválido
-	if existe, activo, err := repo.ValidarTutorRamo(ctx, uid, "MAT1610"); err != nil || !existe || !activo {
-		t.Fatalf("ValidarTutorRamo esperado true/true, obtuve %v/%v err=%v", existe, activo, err)
+	if activo, err := repo.ValidarTutorRamo(ctx, uid, "MAT1610"); err != nil || !activo {
+		t.Fatalf("ValidarTutorRamo esperado true, obtuve %v err=%v", activo, err)
 	}
-	if existe, activo, err := repo.ValidarTutorRamo(ctx, "no-existe", "MAT1610"); err != nil || existe || activo {
-		t.Fatalf("ValidarTutorRamo esperado false/false, obtuve %v/%v err=%v", existe, activo, err)
+	if activo, err := repo.ValidarTutorRamo(ctx, "no-existe", "MAT1610"); err != nil || activo {
+		t.Fatalf("ValidarTutorRamo esperado false, obtuve %v err=%v", activo, err)
 	}
-	if existe, activo, err := repo.ValidarTutorRamo(ctx, "mal-uuid", "MAT1610"); err != nil || existe || activo {
-		t.Fatalf("ValidarTutorRamo para 22P02 esperado false/false, obtuve %v/%v err=%v", existe, activo, err)
+	if activo, err := repo.ValidarTutorRamo(ctx, "mal-uuid", "MAT1610"); err != nil || activo {
+		t.Fatalf("ValidarTutorRamo para 22P02 esperado false, obtuve %v err=%v", activo, err)
+	}
+}
+
+type stubCatalogoRepo struct {
+	domain.UsuarioRepository
+	llamadas int
+	err      error
+}
+
+func (s *stubCatalogoRepo) ListarRamos(_ context.Context) ([]domain.Ramo, error) {
+	s.llamadas++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return []domain.Ramo{{Codigo: "MAT1610", Nombre: "Cálculo I"}}, nil
+}
+
+func TestCachedCatalogoRepository_HitTTLYError(t *testing.T) {
+	ahora := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	base := &stubCatalogoRepo{}
+	cached := NewCachedCatalogoRepository(base, 5*time.Minute)
+	cached.now = func() time.Time { return ahora }
+
+	ctx := context.Background()
+	if _, err := cached.ListarRamos(ctx); err != nil {
+		t.Fatalf("primera llamada falló: %v", err)
+	}
+	if _, err := cached.ListarRamos(ctx); err != nil {
+		t.Fatalf("segunda llamada falló: %v", err)
+	}
+	if base.llamadas != 1 {
+		t.Fatalf("esperaba 1 consulta (cache hit), obtuve %d", base.llamadas)
+	}
+
+	ahora = ahora.Add(6 * time.Minute)
+	if _, err := cached.ListarRamos(ctx); err != nil {
+		t.Fatalf("recarga tras TTL falló: %v", err)
+	}
+	if base.llamadas != 2 {
+		t.Fatalf("esperaba 2 consultas tras expirar TTL, obtuve %d", base.llamadas)
+	}
+
+	baseErr := &stubCatalogoRepo{err: errors.New("db caída")}
+	cachedErr := NewCachedCatalogoRepository(baseErr, 0)
+	if _, err := cachedErr.ListarRamos(ctx); err == nil {
+		t.Fatal("se esperaba error propagado")
 	}
 }

@@ -4,6 +4,15 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
+)
+
+const (
+	MaxNombreRunes       = 120
+	MaxEmailLen          = 254
+	MaxPasswordBytes     = 72 // Límite nativo de bcrypt
+	MaxBatchIDs          = 500
+	MaxRamosPorSolicitud = 50
 )
 
 var (
@@ -47,8 +56,18 @@ func NormalizarEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+func EsNombreValido(nombre string) bool {
+	limpio := strings.TrimSpace(nombre)
+	return limpio != "" && utf8.RuneCountInString(limpio) <= MaxNombreRunes
+}
+
 func EsEmailValido(email string) bool {
-	return emailRegex.MatchString(strings.TrimSpace(email))
+	limpio := strings.TrimSpace(email)
+	return limpio != "" && len(limpio) <= MaxEmailLen && emailRegex.MatchString(limpio)
+}
+
+func EsPasswordValida(password string) bool {
+	return len(password) > 0 && len(password) <= MaxPasswordBytes
 }
 
 func EsUUIDValido(id string) bool {

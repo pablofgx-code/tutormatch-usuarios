@@ -26,8 +26,17 @@ jobs:
       - name: Verificar análisis estático (go vet)
         run: go vet ./cmd/... ./internal/...
 
-      - name: Ejecutar tests unitarios y medir cobertura
-        run: go test -v -cover ./internal/...
+      - name: Ejecutar tests con race detector y medir cobertura
+        run: go test -v -race -coverprofile=coverage.out ./internal/...
+
+      - name: Verificar umbral mínimo de cobertura (60%)
+        run: |
+          TOTAL=$(go tool cover -func=coverage.out | grep total: | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Cobertura total: ${TOTAL}%"
+          awk -v cov="$TOTAL" 'BEGIN { if (cov < 60.0) { print "ERROR: cobertura menor al 60%"; exit 1 } }'
 
       - name: Compilar binario del servidor
-        run: go build -v -o usuarios-server ./cmd/server/main.go
+        run: go build -v -o bin/usuarios-server ./cmd/server/main.go
+
+      - name: Validar construcción de imagen Docker
+        run: docker build -t tutormatch-usuarios:${{ github.sha }} .

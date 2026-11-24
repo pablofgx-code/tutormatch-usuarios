@@ -1,28 +1,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: usuarios-grpc
+  name: usuarios
   labels:
-    app: usuarios-grpc
+    app: usuarios
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: usuarios-grpc
+      app: usuarios
   template:
     metadata:
       labels:
-        app: usuarios-grpc
+        app: usuarios
     spec:
       containers:
-        - name: usuarios-grpc
-          image: tutormatch-usuarios-grpc:latest
+        - name: usuarios
+          image: tutormatch-usuarios:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 50051
+            - name: grpc
+              containerPort: 9090
           env:
             - name: PORT
-              value: "50051"
+              value: "9090"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -33,16 +34,40 @@ spec:
                 secretKeyRef:
                   name: jwt-secret
                   key: secret
+          readinessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: usuarios-service
+  name: usuarios
+  labels:
+    app: usuarios
 spec:
   type: ClusterIP
   selector:
-    app: usuarios-grpc
+    app: usuarios
   ports:
-    - protocol: TCP
-      port: 50051
-      targetPort: 50051
+    - name: grpc
+      protocol: TCP
+      port: 9090
+      targetPort: 9090

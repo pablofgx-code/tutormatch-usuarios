@@ -75,7 +75,7 @@ func (r *PostgresRepository) ObtenerPorID(ctx context.Context, id string) (*doma
 		&u.ID, &u.Nombre, &u.Email, &u.PasswordHash, &u.EsTutor, &u.CreadoEn,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) || esErrorUUIDInvalido(err) {
 			return nil, domain.ErrNoEncontrado
 		}
 		return nil, fmt.Errorf("error al obtener usuario por id: %w", err)
@@ -143,7 +143,7 @@ func (r *PostgresRepository) AgregarRamosTutorTx(ctx context.Context, usuarioID 
 			if esErrorDuplicado(err) {
 				return domain.ErrYaExiste
 			}
-			if esErrorLlaveForanea(err) {
+			if esErrorLlaveForanea(err) || esErrorUUIDInvalido(err) {
 				return domain.ErrNoEncontrado
 			}
 			return fmt.Errorf("error al inscribir ramo %s: %w", rm.RamoCodigo, err)
@@ -169,6 +169,9 @@ func (r *PostgresRepository) CambiarEstadoRamoTx(ctx context.Context, usuarioID,
 		usuarioID, ramoCodigo, activo,
 	)
 	if err != nil {
+		if esErrorUUIDInvalido(err) {
+			return domain.ErrNoEncontrado
+		}
 		return fmt.Errorf("error al cambiar estado del ramo: %w", err)
 	}
 
@@ -246,8 +249,14 @@ func (r *PostgresRepository) ListarTutoresPorRamo(ctx context.Context, ramoCodig
 func (r *PostgresRepository) ValidarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, bool, error) {
 	var existe bool
 	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM usuarios WHERE id = $1)`, tutorID).Scan(&existe)
-	if err != nil || !existe {
+	if err != nil {
+		if esErrorUUIDInvalido(err) {
+			return false, false, nil
+		}
 		return false, false, err
+	}
+	if !existe {
+		return false, false, nil
 	}
 
 	var activo bool
@@ -262,7 +271,7 @@ func (r *PostgresRepository) ValidarTutorRamo(ctx context.Context, tutorID, ramo
 	return true, activo, nil
 }
 
-// recalcularEsTutor aplica las reglas 2 y 3 dentro de la misma transacción
+// recalcularEsTutor aplica las reglas 2 y 3 dentro de la misma transacción.
 func (r *PostgresRepository) recalcularEsTutor(ctx context.Context, tx *sql.Tx, usuarioID string) error {
 	query := `
 		UPDATE usuarios
@@ -319,4 +328,9 @@ func esErrorDuplicado(err error) bool {
 func esErrorLlaveForanea(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "23503") || strings.Contains(msg, "foreign key constraint")
+}
+
+func esErrorUUIDInvalido(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "22P02") || strings.Contains(msg, "invalid input syntax for type uuid")
 }

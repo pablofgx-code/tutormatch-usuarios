@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,15 +21,24 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-const defaultDevJWTSecret = "dev-secret-cambiar-en-produccion"
+const (
+	defaultDevJWTSecret = "dev-secret-cambiar-en-produccion"
+	minProdJWTSecretLen = 32
+	maxGRPCMsgBytes     = 1 << 20 // 1 MB
+)
 
 func main() {
+	appEnv := strings.ToLower(getEnv("APP_ENV", "development"))
 	dbURL := getEnv("DATABASE_URL", "postgres://tutormatch:secretpassword@localhost:5432/usuarios_db?sslmode=disable")
 	jwtSecret := getEnv("JWT_SECRET", defaultDevJWTSecret)
 	port := getEnv("PORT", "50051")
 
-	if jwtSecret == defaultDevJWTSecret {
-		log.Println("ADVERTENCIA: usando JWT_SECRET de desarrollo; configurar Secret en producción")
+	if appEnv == "production" {
+		if jwtSecret == "" || jwtSecret == defaultDevJWTSecret || len(jwtSecret) < minProdJWTSecretLen {
+			log.Fatal("ERROR FATAL: en APP_ENV=production JWT_SECRET es obligatorio, no puede usar el valor de desarrollo y debe tener al menos 32 caracteres")
+		}
+	} else if jwtSecret == defaultDevJWTSecret {
+		log.Println("ADVERTENCIA: usando JWT_SECRET de desarrollo; configurar Secret seguro en producción")
 	}
 
 	db, err := sql.Open("pgx", dbURL)
@@ -48,8 +58,9 @@ func main() {
 	}
 	log.Println("Conexión a PostgreSQL establecida correctamente")
 
-	// Inyección de dependencias siguiendo Clean Architecture
-	repo := repository.NewPostgresRepository(db)
+	// Inyección de dependencias + Decorator de caché TTL para el catálogo de ramos
+	pgRepo := repository.NewPostgresRepository(db)
+	repo := repository.NewCachedCatalogoRepository(pgRepo, 10*time.Minute)
 	hasher := security.NewBcryptHasher()
 	tokenProvider := security.NewJWTProvider(jwtSecret)
 	svc := service.NewUsuarioService(repo, hasher, tokenProvider)
@@ -60,13 +71,18 @@ func main() {
 		log.Fatalf("error al escuchar en el puerto %s: %v", port, err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxGRPCMsgBytes),
+		grpc.UnaryInterceptor(grpcadapter.RecoveryInterceptor),
+	)
 	usuariosv1.RegisterUsuariosServiceServer(grpcServer, handler)
 
-	// Habilita introspección para probar desde Postman o grpcurl sin cargar el archivo proto a mano
-	reflection.Register(grpcServer)
+	// Server Reflection solo fuera de producción para reducir superficie de exposición.
+	if appEnv != "production" {
+		reflection.Register(grpcServer)
+	}
 
-	// Apagado elegante (Graceful Shutdown) cuando se detiene el contenedor o se presiona Ctrl+C
+	// Apagado elegante (Graceful Shutdown)
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -75,7 +91,7 @@ func main() {
 		grpcServer.GracefulStop()
 	}()
 
-	log.Printf("Servidor gRPC de Usuarios escuchando en el puerto %s", port)
+	log.Printf("Servidor gRPC de Usuarios escuchando en el puerto %s (entorno: %s)", port, appEnv)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("error ejecutando servidor gRPC: %v", err)
 	}

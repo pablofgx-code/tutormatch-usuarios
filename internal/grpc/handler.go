@@ -5,15 +5,28 @@ import (
 
 	usuariosv1 "github.com/tutormatch/usuarios/gen/usuariosv1/usuarios/v1"
 	"github.com/tutormatch/usuarios/internal/domain"
-	"github.com/tutormatch/usuarios/internal/service"
 )
+
+// UsuarioUseCase desacopla el adaptador gRPC de la implementación concreta del servicio (DIP).
+type UsuarioUseCase interface {
+	RegistroUsuario(ctx context.Context, nombre, email, password string) (string, *domain.Usuario, error)
+	Login(ctx context.Context, email, password string) (string, *domain.Usuario, error)
+	ObtenerUsuario(ctx context.Context, id string) (*domain.Usuario, error)
+	ObtenerUsuarios(ctx context.Context, ids []string) ([]*domain.Usuario, error)
+	AgregarRamosTutor(ctx context.Context, usuarioID string, ramos []domain.InscripcionRamoInput) (*domain.Usuario, error)
+	QuitarRamoTutor(ctx context.Context, usuarioID, ramoCodigo string) (*domain.Usuario, error)
+	ReactivarRamoTutor(ctx context.Context, usuarioID, ramoCodigo string) (*domain.Usuario, error)
+	ListarRamos(ctx context.Context) ([]domain.Ramo, error)
+	ListarTutoresPorRamo(ctx context.Context, ramoCodigo string) ([]*domain.Usuario, error)
+	ValidarTutorRamo(ctx context.Context, tutorID, ramoCodigo string) (bool, error)
+}
 
 type UsuarioHandler struct {
 	usuariosv1.UnimplementedUsuariosServiceServer
-	svc *service.UsuarioService
+	svc UsuarioUseCase
 }
 
-func NewUsuarioHandler(svc *service.UsuarioService) *UsuarioHandler {
+func NewUsuarioHandler(svc UsuarioUseCase) *UsuarioHandler {
 	return &UsuarioHandler{svc: svc}
 }
 

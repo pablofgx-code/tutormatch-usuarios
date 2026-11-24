@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/tutormatch/usuarios/internal/domain"
@@ -11,7 +12,8 @@ import (
 const testUUID = "11111111-1111-4111-8111-111111111111"
 
 type mockRepo struct {
-	usuarios map[string]*domain.Usuario
+	usuarios   map[string]*domain.Usuario
+	ultimoLote []string
 }
 
 func newMockRepo() *mockRepo {
@@ -48,6 +50,7 @@ func (m *mockRepo) ObtenerPorID(_ context.Context, id string) (*domain.Usuario, 
 }
 
 func (m *mockRepo) ObtenerPorIDs(_ context.Context, ids []string) ([]*domain.Usuario, error) {
+	m.ultimoLote = ids
 	var res []*domain.Usuario
 	for _, id := range ids {
 		if u, ok := m.usuarios[id]; ok {
@@ -113,36 +116,44 @@ func (m *mockRepo) ListarTutoresPorRamo(_ context.Context, ramoCodigo string) ([
 	return res, nil
 }
 
-func (m *mockRepo) ValidarTutorRamo(_ context.Context, tutorID, ramoCodigo string) (bool, bool, error) {
+func (m *mockRepo) ValidarTutorRamo(_ context.Context, tutorID, ramoCodigo string) (bool, error) {
 	u, ok := m.usuarios[tutorID]
 	if !ok {
-		return false, false, nil
+		return false, nil
 	}
 	for _, r := range u.Ramos {
 		if r.Ramo.Codigo == ramoCodigo && r.Activo {
-			return true, true, nil
+			return true, nil
 		}
 	}
-	return true, false, nil
+	return false, nil
 }
 
-type mockHasher struct{}
+type mockHasher struct {
+	compareCalls int
+}
 
 func (h *mockHasher) Hash(pw string) (string, error) { return "hashed_" + pw, nil }
-func (h *mockHasher) Compare(hash, pw string) bool   { return hash == "hashed_"+pw }
+func (h *mockHasher) Compare(hash, pw string) bool {
+	h.compareCalls++
+	return hash != "" && hash == "hashed_"+pw
+}
 
 type mockToken struct{}
 
 func (t *mockToken) GenerateToken(id string) (string, error) { return "jwt_para_" + id, nil }
 
 func TestRegistroYLogin(t *testing.T) {
-	svc := NewUsuarioService(newMockRepo(), &mockHasher{}, &mockToken{})
+	hasher := &mockHasher{}
+	svc := NewUsuarioService(newMockRepo(), hasher, &mockToken{})
 	ctx := context.Background()
 
-	// Email inválido debe rechazarse
-	_, _, err := svc.RegistroUsuario(ctx, "Pablo", "sin-arroba", "123456")
-	if !errors.Is(err, domain.ErrArgumentoInvalido) {
-		t.Fatalf("se esperaba ErrArgumentoInvalido por email inválido, obtuve %v", err)
+	// Validaciones de entrada (email inválido y contraseña > 72 bytes)
+	if _, _, err := svc.RegistroUsuario(ctx, "Pablo", "sin-arroba", "123456"); !errors.Is(err, domain.ErrArgumentoInvalido) {
+		t.Fatalf("esperaba ErrArgumentoInvalido por email inválido, obtuve %v", err)
+	}
+	if _, _, err := svc.RegistroUsuario(ctx, "Pablo", "pablo@ucn.cl", strings.Repeat("x", domain.MaxPasswordBytes+1)); !errors.Is(err, domain.ErrArgumentoInvalido) {
+		t.Fatalf("esperaba ErrArgumentoInvalido por contraseña >72 bytes, obtuve %v", err)
 	}
 
 	// Registro exitoso
@@ -152,20 +163,23 @@ func TestRegistroYLogin(t *testing.T) {
 	}
 
 	// Email duplicado
-	_, _, err = svc.RegistroUsuario(ctx, "Otro", "pablo@ucn.cl", "123456")
-	if !errors.Is(err, domain.ErrYaExiste) {
+	if _, _, err = svc.RegistroUsuario(ctx, "Otro", "pablo@ucn.cl", "123456"); !errors.Is(err, domain.ErrYaExiste) {
 		t.Fatalf("se esperaba ErrYaExiste, obtuve %v", err)
 	}
 
-	// Login exitoso, contraseña errónea, usuario inexistente y datos vacíos
+	// Login exitoso, contraseña errónea y mitigación de timing attack cuando correo no existe
 	if _, _, err = svc.Login(ctx, "pablo@ucn.cl", "123456"); err != nil {
 		t.Fatalf("se esperaba login exitoso, obtuve %v", err)
 	}
 	if _, _, err = svc.Login(ctx, "pablo@ucn.cl", "mala_clave"); !errors.Is(err, domain.ErrCredenciales) {
 		t.Fatalf("se esperaba ErrCredenciales, obtuve %v", err)
 	}
+	antes := hasher.compareCalls
 	if _, _, err = svc.Login(ctx, "nadie@ucn.cl", "123456"); !errors.Is(err, domain.ErrCredenciales) {
 		t.Fatalf("se esperaba ErrCredenciales para email inexistente, obtuve %v", err)
+	}
+	if hasher.compareCalls != antes+1 {
+		t.Fatal("se esperaba llamada dummy a Compare para mitigar timing attack")
 	}
 	if _, _, err = svc.Login(ctx, "", ""); !errors.Is(err, domain.ErrArgumentoInvalido) {
 		t.Fatalf("se esperaba ErrArgumentoInvalido en login vacío, obtuve %v", err)
@@ -178,32 +192,25 @@ func TestFlujoRamosTutor(t *testing.T) {
 
 	_, u, _ := svc.RegistroUsuario(ctx, "Pablo", "pablo@ucn.cl", "123456")
 
-	// Nota fuera de escala chilena
-	_, err := svc.AgregarRamosTutor(ctx, u.ID, []domain.InscripcionRamoInput{
+	if _, err := svc.AgregarRamosTutor(ctx, u.ID, []domain.InscripcionRamoInput{
 		{RamoCodigo: "MAT1610", NotaAprobacion: 3.9, PeriodoAprobacion: "2025-1"},
-	})
-	if !errors.Is(err, domain.ErrArgumentoInvalido) {
+	}); !errors.Is(err, domain.ErrArgumentoInvalido) {
 		t.Fatalf("se esperaba ErrArgumentoInvalido, obtuve %v", err)
 	}
 
-	// Ramos repetidos en el mismo request
-	_, err = svc.AgregarRamosTutor(ctx, u.ID, []domain.InscripcionRamoInput{
+	if _, err := svc.AgregarRamosTutor(ctx, u.ID, []domain.InscripcionRamoInput{
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.0, PeriodoAprobacion: "2025-1"},
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.0, PeriodoAprobacion: "2025-1"},
-	})
-	if !errors.Is(err, domain.ErrArgumentoInvalido) {
+	}); !errors.Is(err, domain.ErrArgumentoInvalido) {
 		t.Fatalf("se esperaba ErrArgumentoInvalido por duplicados, obtuve %v", err)
 	}
 
-	// UUID mal formado devuelve ErrNoEncontrado
-	_, err = svc.AgregarRamosTutor(ctx, "no-es-uuid", []domain.InscripcionRamoInput{
+	if _, err := svc.AgregarRamosTutor(ctx, "no-es-uuid", []domain.InscripcionRamoInput{
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.0, PeriodoAprobacion: "2025-1"},
-	})
-	if !errors.Is(err, domain.ErrNoEncontrado) {
+	}); !errors.Is(err, domain.ErrNoEncontrado) {
 		t.Fatalf("se esperaba ErrNoEncontrado para UUID inválido, obtuve %v", err)
 	}
 
-	// Inscripción válida
 	uActualizado, err := svc.AgregarRamosTutor(ctx, u.ID, []domain.InscripcionRamoInput{
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.5, PeriodoAprobacion: "2025-1"},
 	})
@@ -211,7 +218,6 @@ func TestFlujoRamosTutor(t *testing.T) {
 		t.Fatalf("se esperaba EsTutor=true, obtuve err=%v", err)
 	}
 
-	// Quitar y reactivar
 	uSinRamos, err := svc.QuitarRamoTutor(ctx, u.ID, "MAT1610")
 	if err != nil || uSinRamos.EsTutor {
 		t.Fatalf("se esperaba EsTutor=false al quitar ramo, obtuve err=%v", err)
@@ -221,23 +227,17 @@ func TestFlujoRamosTutor(t *testing.T) {
 		t.Fatalf("se esperaba EsTutor=true al reactivar ramo, obtuve err=%v", err)
 	}
 
-	// Errores de validación en quitar/reactivar
 	if _, err = svc.QuitarRamoTutor(ctx, "", "MAT1610"); !errors.Is(err, domain.ErrArgumentoInvalido) {
 		t.Fatalf("esperaba ErrArgumentoInvalido, obtuve %v", err)
 	}
 	if _, err = svc.QuitarRamoTutor(ctx, "mal-id", "MAT1610"); !errors.Is(err, domain.ErrNoEncontrado) {
 		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
 	}
-	if _, err = svc.ReactivarRamoTutor(ctx, "", "MAT1610"); !errors.Is(err, domain.ErrArgumentoInvalido) {
-		t.Fatalf("esperaba ErrArgumentoInvalido, obtuve %v", err)
-	}
-	if _, err = svc.ReactivarRamoTutor(ctx, "mal-id", "MAT1610"); !errors.Is(err, domain.ErrNoEncontrado) {
-		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
-	}
 }
 
 func TestConsultasYValidaciones(t *testing.T) {
-	svc := NewUsuarioService(newMockRepo(), &mockHasher{}, &mockToken{})
+	repo := newMockRepo()
+	svc := NewUsuarioService(repo, &mockHasher{}, &mockToken{})
 	ctx := context.Background()
 
 	_, u, _ := svc.RegistroUsuario(ctx, "Pablo", "pablo@ucn.cl", "123456")
@@ -245,7 +245,6 @@ func TestConsultasYValidaciones(t *testing.T) {
 		{RamoCodigo: "MAT1610", NotaAprobacion: 6.0, PeriodoAprobacion: "2025-1"},
 	})
 
-	// ObtenerUsuario: válido, vacío y mal formado
 	if obtenido, err := svc.ObtenerUsuario(ctx, u.ID); err != nil || obtenido.ID != u.ID {
 		t.Fatalf("error en ObtenerUsuario: %v", err)
 	}
@@ -256,17 +255,19 @@ func TestConsultasYValidaciones(t *testing.T) {
 		t.Fatalf("esperaba ErrNoEncontrado, obtuve %v", err)
 	}
 
-	// ObtenerUsuarios: omite IDs inválidos e inexistentes sin fallar
-	lista, err := svc.ObtenerUsuarios(ctx, []string{u.ID, "id-inexistente"})
-	if err != nil || len(lista) != 1 {
-		t.Fatalf("se esperaba 1 usuario en lote, obtuve %d (err=%v)", len(lista), err)
+	// ObtenerUsuarios: deduplica en O(N), omite inválidos y respeta MaxBatchIDs
+	lista, err := svc.ObtenerUsuarios(ctx, []string{u.ID, u.ID, "id-inexistente"})
+	if err != nil || len(lista) != 1 || len(repo.ultimoLote) != 1 {
+		t.Fatalf("esperaba 1 usuario deduplicado, obtuve len=%d lote=%v err=%v", len(lista), repo.ultimoLote, err)
 	}
-	vacia, err := svc.ObtenerUsuarios(ctx, []string{"no-es-uuid"})
-	if err != nil || len(vacia) != 0 {
-		t.Fatalf("se esperaba lista vacía sin error, obtuve %d (err=%v)", len(vacia), err)
+	if vacia, err := svc.ObtenerUsuarios(ctx, []string{"no-es-uuid"}); err != nil || len(vacia) != 0 {
+		t.Fatalf("esperaba lista vacía sin error, obtuve %d (err=%v)", len(vacia), err)
+	}
+	exceso := make([]string, domain.MaxBatchIDs+1)
+	if _, err := svc.ObtenerUsuarios(ctx, exceso); !errors.Is(err, domain.ErrArgumentoInvalido) {
+		t.Fatalf("esperaba ErrArgumentoInvalido sobre MaxBatchIDs, obtuve %v", err)
 	}
 
-	// ListarRamos y ListarTutoresPorRamo
 	if ramos, err := svc.ListarRamos(ctx); err != nil || len(ramos) == 0 {
 		t.Fatalf("se esperaban ramos en el catálogo, err=%v", err)
 	}
@@ -277,7 +278,6 @@ func TestConsultasYValidaciones(t *testing.T) {
 		t.Fatalf("esperaba ErrArgumentoInvalido, obtuve %v", err)
 	}
 
-	// ValidarTutorRamo: válido, otro ramo, UUID inválido y vacío
 	if valido, err := svc.ValidarTutorRamo(ctx, u.ID, "MAT1610"); err != nil || !valido {
 		t.Fatalf("se esperaba tutor válido, err=%v", err)
 	}

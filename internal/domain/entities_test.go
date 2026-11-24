@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -10,8 +11,16 @@ func TestValidacionesDominio(t *testing.T) {
 		t.Fatalf("email normalizado inesperado: %q", got)
 	}
 
-	if !EsEmailValido("ana@uc.cl") || EsEmailValido("sin-arroba") || EsEmailValido("a @b.cl") {
+	if !EsNombreValido("Ana Pérez") || EsNombreValido("   ") || EsNombreValido(strings.Repeat("a", MaxNombreRunes+1)) {
+		t.Fatal("EsNombreValido devolvió resultado inesperado")
+	}
+
+	if !EsEmailValido("ana@uc.cl") || EsEmailValido("sin-arroba") || EsEmailValido("a @b.cl") || EsEmailValido(strings.Repeat("a", MaxEmailLen)+"@uc.cl") {
 		t.Fatal("EsEmailValido devolvió resultado inesperado")
+	}
+
+	if !EsPasswordValida("secreta123") || EsPasswordValida("") || EsPasswordValida(strings.Repeat("x", MaxPasswordBytes+1)) {
+		t.Fatal("EsPasswordValida devolvió resultado inesperado")
 	}
 
 	if !EsUUIDValido("11111111-1111-4111-8111-111111111111") || EsUUIDValido("no-es-uuid") {
